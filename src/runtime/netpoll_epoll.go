@@ -104,6 +104,25 @@ func netpollBreak() {
 // delay < 0: blocks indefinitely
 // delay == 0: does not block, just polls
 // delay > 0: block for up to that many nanoseconds
+
+
+/*
+ * epoll_wait时机:
+ * 首先，client 连接 server 的时候，listener 通过 accept 调用接收新 connection，
+ * 每一个新 connection 都启动一个 goroutine 处理，accept 调用会把该 connection 的 fd 连带所在的 goroutine 上下文信息封装注册到 epoll 的监听列表里去，
+ * 当 goroutine 调用 conn.Read 或者 conn.Write 等需要阻塞等待的函数时，
+ * 会被 gopark 给封存起来并使之休眠，让 P 去执行本地调度队列里的下一个可执行的 goroutine，
+ * 往后 Go scheduler 会在循环调度的 runtime.schedule() 函数以及 sysmon 监控线程中调用 runtime.netpoll
+ * 以获取可运行的 goroutine 列表并通过调用 injectglist 把剩下的 g 放入全局调度队列或者当前 P 本地调度队列去重新执行。
+ * 那么当 I/O 事件发生之后，netpoller 是通过什么方式唤醒那些在 I/O wait 的 goroutine 的？答案是通过 runtime.netpoll。
+ *
+ *
+ * runtime.netpoll 的核心逻辑是：
+ * 根据调用方的入参 delay，设置对应的调用 epollwait 的 timeout 值；
+ * 调用 epollwait 等待发生了可读 / 可写事件的 fd；
+ * 循环 epollwait 返回的事件列表，处理对应的事件类型， 组装可运行的 goroutine 链表并返回。
+ * 转自链接：https://learnku.com/articles/59847
+ */
 func netpoll(delay int64) gList {
 	if epfd == -1 {
 		return gList{}

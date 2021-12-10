@@ -597,17 +597,18 @@ TEXT runtime·sigaltstack(SB),NOSPLIT,$-8
 
 // set tls base to DI
 TEXT runtime·settls(SB),NOSPLIT,$32
+    // 此时di = &m.tls[0]
 #ifdef GOOS_android
 	// Android stores the TLS offset in runtime·tls_g.
 	SUBQ	runtime·tls_g(SB), DI
 #else
-	ADDQ	$8, DI	// ELF wants to use -8(FS)
+	ADDQ	$8, DI	// ELF wants to use -8(FS) ELF 需要使用 -8(FS)，di+=8，执行完此指令后 di = &m.tls[1]
 #endif
-	MOVQ	DI, SI
-	MOVQ	$0x1002, DI	// ARCH_SET_FS
-	MOVQ	$SYS_arch_prctl, AX
+	MOVQ	DI, SI                  // 将地址移动到si中，作为系统调用的第二个参数
+	MOVQ	$0x1002, DI	            // ARCH_SET_FS表示设置FS，作为系统调用的第一个参数
+	MOVQ	$SYS_arch_prctl, AX     // rax存储系统调用号
 	SYSCALL
-	CMPQ	AX, $0xfffffffffffff001
+	CMPQ	AX, $0xfffffffffffff001 // 比较返回结果
 	JLS	2(PC)
 	MOVL	$0xf1, 0xf1  // crash
 	RET

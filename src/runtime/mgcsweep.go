@@ -154,23 +154,30 @@ func finishsweep_m() {
 }
 
 func bgsweep() {
+	// 设置清扫 Goroutine
 	sweep.g = getg()
 
+	// 等待唤醒
 	lockInit(&sweep.lock, lockRankSweep)
 	lock(&sweep.lock)
 	sweep.parked = true
 	gcenable_setup <- 1
 	goparkunlock(&sweep.lock, waitReasonGCSweepWait, traceEvGoBlock, 1)
 
+	// 循环清扫
 	for {
+		// 清扫一个span, 然后进入调度
 		for sweepone() != ^uintptr(0) {
 			sweep.nbgsweep++
 			Gosched()
 		}
+		// 释放一些未使用的标记队列缓冲区到heap
 		for freeSomeWbufs(true) {
 			Gosched()
 		}
 		lock(&sweep.lock)
+		// 判断 sweepdone 标志位是否等于 0
+		// 如果清扫未完成则继续循环
 		if !isSweepDone() {
 			// This can happen if a GC runs between
 			// gosweepone returning ^0 above
@@ -178,6 +185,7 @@ func bgsweep() {
 			unlock(&sweep.lock)
 			continue
 		}
+		// 否则让后台清扫任务进入休眠
 		sweep.parked = true
 		goparkunlock(&sweep.lock, waitReasonGCSweepWait, traceEvGoBlock, 1)
 	}
@@ -257,6 +265,7 @@ func sweepone() uintptr {
 	// increment locks to ensure that the goroutine is not preempted
 	// in the middle of sweep thus leaving the span in an inconsistent state for next GC
 	_g_.m.locks++
+	// 校验是否清扫已完成
 	if atomic.Load(&mheap_.sweepDrained) != 0 {
 		_g_.m.locks--
 		return ^uintptr(0)
@@ -266,6 +275,7 @@ func sweepone() uintptr {
 	sl := newSweepLocker()
 
 	// Find a span to sweep.
+	//查找一个 span 并释放
 	npages := ^uintptr(0)
 	var noMoreWork bool
 	for {
@@ -286,7 +296,9 @@ func sweepone() uintptr {
 		}
 		if s, ok := sl.tryAcquire(s); ok {
 			// Sweep the span we found.
+			// 清理 span
 			npages = s.npages
+			// 回收内存
 			if s.sweep(false) {
 				// Whole span was freed. Count it toward the
 				// page reclaimer credit since these pages can
@@ -408,6 +420,7 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		traceGCSweepSpan(s.npages * _PageSize)
 	}
 
+	// 统计已清理的页数
 	atomic.Xadd64(&mheap_.pagesSwept, int64(s.npages))
 
 	spc := s.spanclass
@@ -527,6 +540,7 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 	}
 
 	// Count the number of free objects in this span.
+	// 计算释放的对象数量
 	nalloc := uint16(s.countAlloc())
 	nfreed := s.allocCount - nalloc
 	if nalloc > s.allocCount {
@@ -570,10 +584,12 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 	// Serialization point.
 	// At this point the mark bits are cleared and allocation ready
 	// to go so release the span.
+	// 设置 span.sweepgen 和 mheap.sweepgen 相等
 	atomic.Store(&s.sweepgen, sweepgen)
 
 	if spc.sizeclass() != 0 {
 		// Handle spans for small objects.
+		// 处理小对象的回收
 		if nfreed > 0 {
 			// Only mark the span as needing zeroing if we've freed any
 			// objects, because a fresh span that had been allocated into,
@@ -592,10 +608,12 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 			// set, check its sweepgen, and ignore it.
 			if nalloc == 0 {
 				// Free totally free span directly back to the heap.
+				// 直接释放 span 到堆中
 				mheap_.freeSpan(s)
 				return true
 			}
 			// Return span back to the right mcentral list.
+			// 将 span 释放到 mcentral 中
 			if uintptr(nalloc) == s.nelems {
 				mheap_.central[spc].mcentral.fullSwept(sweepgen).push(s)
 			} else {
@@ -604,6 +622,7 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		}
 	} else if !preserve {
 		// Handle spans for large objects.
+		// 处理大对象的回收
 		if nfreed != 0 {
 			// Free large object span to heap.
 
@@ -625,6 +644,7 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				s.limit = 0 // prevent mlookup from finding this span
 				sysFault(unsafe.Pointer(s.base()), size)
 			} else {
+				// 直接释放 span 到堆中
 				mheap_.freeSpan(s)
 			}
 			stats := memstats.heapStats.acquire()

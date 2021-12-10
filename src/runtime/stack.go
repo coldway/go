@@ -67,6 +67,14 @@ const (
 	// to each stack below the usual guard area for OS-specific
 	// purposes like signal handling. Used on Windows, Plan 9,
 	// and iOS because they do not use a separate stack.
+	//解释
+	//os        /   _StackSystem
+	//----------+---------------------
+	//win32     /  2048
+	//win64     /  4096
+	//GoosPlan9 /  512
+	//linux     / 0
+	//...
 	_StackSystem = sys.GoosWindows*512*sys.PtrSize + sys.GoosPlan9*512 + sys.GoosIos*sys.GoarchArm64*1024
 
 	// The minimum size of stack used by Go code
@@ -74,6 +82,7 @@ const (
 
 	// The minimum stack size to allocate.
 	// The hackery here rounds FixedStack0 up to a power of 2.
+	//对 linux/freebsd _FixedStack就是2k
 	_FixedStack0 = _StackMin + _StackSystem
 	_FixedStack1 = _FixedStack0 - 1
 	_FixedStack2 = _FixedStack1 | (_FixedStack1 >> 1)
@@ -96,6 +105,7 @@ const (
 	// The guard leaves enough room for one _StackSmall frame plus
 	// a _StackLimit chain of NOSPLIT calls plus _StackSystem
 	// bytes for the OS.
+	// 928
 	_StackGuard = 928*sys.StackGuardMultiplier + _StackSystem
 
 	// After a stack split check the SP is allowed to be this
@@ -148,6 +158,7 @@ const (
 // Stacks are assigned an order according to size.
 //     order = log_2(size/FixedStack)
 // There is a free list for each order.
+//目前order有 0 1 2 3
 var stackpool [_NumStackOrders]struct {
 	item stackpoolItem
 	_    [cpu.CacheLinePadSize - unsafe.Sizeof(stackpoolItem{})%cpu.CacheLinePadSize]byte
@@ -162,6 +173,7 @@ type stackpoolItem struct {
 // Global pool of large stack spans.
 var stackLarge struct {
 	lock mutex
+	// 48 - 13 = 35
 	free [heapAddrBits - pageShift]mSpanList // free lists by log_2(s.npages)
 }
 
@@ -197,6 +209,7 @@ func stackpoolalloc(order uint8) gclinkptr {
 	lockWithRankMayAcquire(&mheap_.lock, lockRankMheap)
 	if s == nil {
 		// no free stacks. Allocate another span worth.
+		//一次申请32KB内存即4页
 		s = mheap_.allocManual(_StackCacheSize>>_PageShift, spanAllocStack)
 		if s == nil {
 			throw("out of memory")
@@ -207,9 +220,13 @@ func stackpoolalloc(order uint8) gclinkptr {
 		if s.manualFreeList.ptr() != nil {
 			throw("bad manualFreeList")
 		}
+		//对新申请的内存，在使用之前先初始化系统栈
 		osStackAlloc(s)
 		s.elemsize = _FixedStack << order
+		//按照order 也就是2k * 2^order 大小进行切割放到链表里
 		for i := uintptr(0); i < _StackCacheSize; i += s.elemsize {
+			//gclinkptr 也是一个指针类型
+			//作用是屏蔽gc扫描
 			x := gclinkptr(s.base() + i)
 			x.ptr().next = s.manualFreeList
 			s.manualFreeList = x
@@ -276,11 +293,17 @@ func stackcacherefill(c *mcache, order uint8) {
 
 	// Grab some stacks from the global cache.
 	// Grab half of the allowed capacity (to prevent thrashing).
+	// 获取一半的允许容量（以防止抖动）
 	var list gclinkptr
 	var size uintptr
 	lock(&stackpool[order].item.mu)
+	//如果 我要申请2^2 = 4kb
+	// then alloc 4kb       +          4kb          + 4kb  + 4kb = 16k
+	//              size = 4kb < 16k  + 4kb = 8kb < 16k + 4k = 12k < 16k + 4
+	// 申请16k
 	for size < _StackCacheSize/2 {
 		x := stackpoolalloc(order)
+		//前插list
 		x.ptr().next = list
 		list = x
 		size += _FixedStack << order
@@ -362,26 +385,47 @@ func stackalloc(n uint32) stack {
 	// If we need a stack of a bigger size, we fall back on allocating
 	// a dedicated span.
 	var v unsafe.Pointer
+	//小对象的分配：
+	// linux/darwin/bsd:
+	// _NumStackOrders = 4
+	// n< 2048 *  2^4 = 2* 2^10* 2^4 = 32 * 2^10 =32k && n<32 * 1024
+	// 只允许申请2k 4k 8k 16k 大小的栈
+	//其实两个条件是一样的 在linux上
 	if n < _FixedStack<<_NumStackOrders && n < _StackCacheSize {
 		order := uint8(0)
 		n2 := n
 		for n2 > _FixedStack {
-			order++
+			// 找到合适的规格class
+			//order 代表: n 是 _FixedStack的几倍
+			// 0: _FixedStack大小，1：代表2倍_FixedStack大小；2代表四倍
+			//这里order只可能为0 1 2 3
+			order ++
 			n2 >>= 1
 		}
 		var x gclinkptr
+		// 三种情况：
+		// 如果开启了stack cache（默认开启）
+		// 在gc时从global获取
 		if stackNoCache != 0 || thisg.m.p == 0 || thisg.m.preemptoff != "" {
 			// thisg.m.p == 0 can happen in the guts of exitsyscall
 			// or procresize. Just get a stack from the global pool.
 			// Also don't touch stackcache during gc
 			// as it's flushed concurrently.
 			lock(&stackpool[order].item.mu)
+			// 从全局的stackpool来进行分配
 			x = stackpoolalloc(order)
 			unlock(&stackpool[order].item.mu)
 		} else {
+			//首先去P本地内存缓存mcache.stackcache中获取可用内存
+			//如果本地缓存中存在，则直接获取，并更新链表
+			//如果不存在则 调用stackcacherefill从stackpool获取并放到stackcache
+
 			c := thisg.m.p.ptr().mcache
 			x = c.stackcache[order].list
+			// 如果mcache中没有可以分配的内存
 			if x.ptr() == nil {
+				// 先从global cache pool中获取一批stack内存(_StackCacheSize/2，目前大小16k)，
+				// 将这批stack内存放入到mcache的stackcache中
 				stackcacherefill(c, order)
 				x = c.stackcache[order].list
 			}
@@ -390,12 +434,17 @@ func stackalloc(n uint32) stack {
 		}
 		v = unsafe.Pointer(x)
 	} else {
+		//大对象分配 >=32k
 		var s *mspan
+		// PageShift = 13
+		// 一页8k
 		npage := uintptr(n) >> _PageShift
 		log2npage := stacklog2(npage)
 
 		// Try to get a stack from the large stack cache.
 		lock(&stackLarge.lock)
+		//stackLarge数组所指向的空闲内存空间全部是通过栈回收来获得的。
+		//todo so interesting
 		if !stackLarge.free[log2npage].isEmpty() {
 			s = stackLarge.free[log2npage].first
 			stackLarge.free[log2npage].remove(s)
@@ -406,6 +455,7 @@ func stackalloc(n uint32) stack {
 
 		if s == nil {
 			// Allocate a new stack from the heap.
+			// 如果global stack cache中还是没有申请到内存，那么会直接向mheap进行申请。
 			s = mheap_.allocManual(npage, spanAllocStack)
 			if s == nil {
 				throw("out of memory")
@@ -904,7 +954,7 @@ func copystack(gp *g, newsize uintptr) {
 	adjustctxt(gp, &adjinfo)
 	adjustdefers(gp, &adjinfo)
 	adjustpanics(gp, &adjinfo)
-	if adjinfo.sghi != 0 {
+	if adjinfo.sghi != 0  {
 		adjinfo.sghi += adjinfo.delta
 	}
 
@@ -925,6 +975,8 @@ func copystack(gp *g, newsize uintptr) {
 }
 
 // round x up to a power of 2.
+//函数的功能：取得一个值使得不等式 2^n >= x 成立且左边是所有成立值中的最小值
+//如：round2(15) = 16 ; round2(18)=32 ...
 func round2(x int32) int32 {
 	s := uint(0)
 	for 1<<s < x {
@@ -1057,6 +1109,7 @@ func newstack() {
 
 	// Allocate a bigger segment and move the stack.
 	oldsize := gp.stack.hi - gp.stack.lo
+	//栈扩容时直接申请2倍大小的连续内存
 	newsize := oldsize * 2
 
 	// Make sure we grow at least as much as needed to fit the new frame.

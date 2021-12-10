@@ -207,6 +207,10 @@ const (
 	// arenaBaseOffset to offset into the top 4 GiB.
 	//
 	// WebAssembly currently has a limit of 4GB linear memory.
+
+
+	// linuxxxxx：
+	// heapaddrbits = _64bit*48 + (1-_64bit)*32 = 48
 	heapAddrBits = (_64bit*(1-sys.GoarchWasm)*(1-sys.GoosIos*sys.GoarchArm64))*48 + (1-_64bit+sys.GoarchWasm)*(32-(sys.GoarchMips+sys.GoarchMipsle)) + 33*sys.GoosIos*sys.GoarchArm64
 
 	// maxAlloc is the maximum size of an allocation. On 64-bit,
@@ -656,6 +660,7 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 			v = sysReserve(unsafe.Pointer(p), n)
 		}
 		if p == uintptr(v) {
+			// 获取成功，更新 arena hint
 			// Success. Update the hint.
 			if !hint.down {
 				p += n
@@ -670,6 +675,8 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 		// told to only return the requested address. In
 		// particular, this is already how Windows behaves, so
 		// it would simplify things there.
+
+		// 失败，丢弃并重新尝试
 		if v != nil {
 			sysFree(v, n, nil)
 		}
@@ -726,6 +733,13 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 		throw("misrounded allocation in sysAlloc")
 	}
 
+//<<<<<<< Updated upstream
+//=======
+//	// 正式开始使用保留的内存
+//	// Transition from Reserved to Prepared.
+//	sysMap(v, size, &memstats.heap_sys)
+//
+//>>>>>>> Stashed changes
 mapped:
 	// Create arena metadata.
 	for ri := arenaIndex(uintptr(v)); ri <= arenaIndex(uintptr(v)+size-1); ri++ {
@@ -972,12 +986,14 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	shouldhelpgc := false
 	dataSize := size
+	// 获取mcache，用于处理微对象和小对象的分配
 	c := getMCache()
 	if c == nil {
 		throw("mallocgc called without a P or outside bootstrapping")
 	}
 	var span *mspan
 	var x unsafe.Pointer
+	// 表示对象是否包含指针，true表示对象里没有指针
 	noscan := typ == nil || typ.ptrdata == 0
 	// In some cases block zeroing can profitably (for latency reduction purposes)
 	// be delayed till preemption is possible; isZeroed tracks that state.
@@ -1123,6 +1139,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	// All slots hold nil so no scanning is needed.
 	// This may be racing with GC so do it atomically if there can be
 	// a race marking the bit.
+	// 在 GC 期间分配的新对象都会被标记成黑色
 	if gcphase != _GCoff {
 		gcmarknewobject(span, uintptr(x), size, scanSize)
 	}

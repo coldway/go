@@ -940,6 +940,12 @@ func (h *mheap) alloc(npages uintptr, spanclass spanClass, needzero bool) (*mspa
 //
 // If new code is written to call allocManual, do NOT use an
 // existing spanAllocType value and instead declare a new one.
+//allocManual分配npage页的手动管理的span。
+//如果分配失败，allocManual返回nil。
+//allocManual将用于* stat的字节添加到其中，该字节应该是memstats使用中的字段。 与GC堆中的分配不同，该分配*不*计入heap_inuse或heap_sys。
+//如果设置了span.needzero，则支持返回的范围的内存可能不会为零。
+//必须在系统堆栈上调用allocManual，因为它可能通过allocSpan获取堆锁。 有关详细信息，请参见mheap。
+//manual内存会在state上标示Manual状态。
 //
 //go:systemstack
 func (h *mheap) allocManual(npages uintptr, typ spanAllocType) *mspan {
@@ -973,7 +979,9 @@ func (h *mheap) setSpans(base, npage uintptr, s *mspan) {
 // allocator can otherwise prove the memory it's allocating is already zero because
 // they're fresh from the operating system. It updates heapArena metadata that is
 // critical for future page allocations.
-//
+//allocNeedsZero检查假设已分配的地址空间区域[base，base + npage * pageSize）是否需要清零，更新堆舞台元数据以供将来分配。
+//每次从堆中分配页面时，都必须调用此方法，即使页面分配器可以以其他方式证明其分配的内存已经为零，因为它们是从操作系统中获取的。
+//它更新了heapArena元数据，这对于将来的页面分配至关重要。
 // There are no locking constraints on this method.
 func (h *mheap) allocNeedsZero(base, npage uintptr) (needZero bool) {
 	for npage > 0 {
@@ -1126,6 +1134,13 @@ func (h *mheap) freeMSpanLocked(s *mspan) {
 // allocSpan must be called on the system stack both because it acquires
 // the heap lock and because it must block GC transitions.
 //
+//allocSpan分配一个拥有npages内存的mspan。
+//如果manual == false，则allocSpan分配类spanclass的堆范围并更新堆记帐。
+//如果manual == true，则allocSpan分配一个手动管理的跨度（spanclass被忽略），并且调用方负责与其使用跨度有关的任何记帐。
+//无论哪种方式，allocSpan都会自动将新分配的跨度中的字节添加到* sysStat中。
+//返回的mspan已完全初始化。
+//h不得锁定。
+//必须在系统堆栈上调用allocSpan，因为它获得了堆锁并且因为它必须阻止GC转换。
 //go:systemstack
 func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass) (s *mspan) {
 	// Function-global state.
@@ -1141,12 +1156,17 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 	// The page cache does not support aligned allocations, so we cannot use
 	// it if we need to provide a physical page aligned stack allocation.
 	pp := gp.m.p.ptr()
+	//64位 sizeof(uint64) = 8
+	//sizeof(uint64)*8/4 = 16
+	//pagecachepages = 64.
+	//相当一次申请的页数npages小于16页便从page cache中获取
 	if !needPhysPageAlign && pp != nil && npages < pageCachePages/4 {
 		c := &pp.pcache
 
 		// If the cache is empty, refill it.
 		if c.empty() {
 			lock(&h.lock)
+			//todo  reading the allocToCache func
 			*c = h.pages.allocToCache()
 			unlock(&h.lock)
 		}
@@ -1214,6 +1234,7 @@ HaveSpan:
 	// At this point, both s != nil and base != 0, and the heap
 	// lock is no longer held. Initialize the span.
 	s.init(base, npages)
+	//todo
 	if h.allocNeedsZero(base, npages) {
 		s.needzero = 1
 	}

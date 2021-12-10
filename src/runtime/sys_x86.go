@@ -16,9 +16,11 @@ import (
 // and then stopped before the first instruction in fn.
 func gostartcall(buf *gobuf, fn, ctxt unsafe.Pointer) {
 	sp := buf.sp
-	sp -= sys.PtrSize
+	sp -= sys.PtrSize // 为返回地址预留空间
+	// buf.pc 存储的是 funcPC(goexit) + sys.PCQuantum
+	// 将其存储到返回地址是为了伪造成 fn 是被 goexit 调用的，在 fn 执行完后返回 goexit执行，做一些清理工作。
 	*(*uintptr)(unsafe.Pointer(sp)) = buf.pc
-	buf.sp = sp
-	buf.pc = uintptr(fn)
+	buf.sp = sp				// 重新赋值
+	buf.pc = uintptr(fn)	// 赋值为函数指针
 	buf.ctxt = ctxt
 }

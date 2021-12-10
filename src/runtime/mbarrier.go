@@ -153,6 +153,11 @@ import (
 // TODO: Perfect for go:nosplitrec since we can't have a safe point
 // anywhere in the bulk barrier or memmove.
 //
+// typedmemmove() 是将类型 _type 的对象从 src 拷贝到 dst, src和dst都是unsafe.Pointer, 这当中涉及到了内存操作.
+// 由于GC的存在, 在拷贝前, 如果 _type 包含指针, 需要开启写屏障 bulkBarrierPreWrite.
+// 然后调用 memmove() 进行内存 拷贝的操作.
+// memmove() 直接是进行内存移动, 使用的是汇编实现的, 代码位置在 src/runtime/memmove_amd64.s.
+// 当然了, 这个操作本身就是单纯的内存操作, 不涉及其他任何内容.
 //go:nosplit
 func typedmemmove(typ *_type, dst, src unsafe.Pointer) {
 	if dst == src {

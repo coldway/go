@@ -298,7 +298,10 @@ func (c *gcControllerState) startCycle() {
 	// dedicated workers so that the utilization is closest to
 	// 25%. For small GOMAXPROCS, this would introduce too much
 	// error, so we add fractional workers in that case.
+	// gcBackgroundUtilization 默认是 0.25
+	// 是GC所占的P的目标值
 	totalUtilizationGoal := float64(gomaxprocs) * gcBackgroundUtilization
+	// dedicatedMarkWorkersNeeded 等于P的数量的25% 加上 0.5 去掉小数点
 	c.dedicatedMarkWorkersNeeded = int64(totalUtilizationGoal + 0.5)
 	utilError := float64(c.dedicatedMarkWorkersNeeded)/totalUtilizationGoal - 1
 	const maxUtilError = 0.3
@@ -311,10 +314,12 @@ func (c *gcControllerState) startCycle() {
 			// Too many dedicated workers.
 			c.dedicatedMarkWorkersNeeded--
 		}
+		// 是 gcMarkWorkerFractionalMode 的任务所占的P的目标值
 		c.fractionalUtilizationGoal = (totalUtilizationGoal - float64(c.dedicatedMarkWorkersNeeded)) / float64(gomaxprocs)
 	} else {
 		c.fractionalUtilizationGoal = 0
 	}
+	//dedicatedMarkWorkersNeeded 与 fractionalUtilizationGoal 的计算过程，这个会在计算 work 工作模式的用到。
 
 	// In STW mode, we just want dedicated workers.
 	if debug.gcstoptheworld > 0 {
@@ -330,6 +335,7 @@ func (c *gcControllerState) startCycle() {
 
 	// Compute initial values for controls that are updated
 	// throughout the cycle.
+	// 计算协助GC的参数
 	c.revise()
 
 	if debug.gcpacertrace > 0 {
@@ -471,21 +477,28 @@ func (c *gcControllerState) endCycle(userForced bool) float64 {
 	// growth if we had the desired CPU utilization). The
 	// difference between this estimate and the GOGC-based goal
 	// heap growth is the error.
+	// 目标Heap增长率 = （下次 GC 完后堆大小 - 堆存活大小）/ 堆存活大小
 	goalGrowthRatio := c.effectiveGrowthRatio()
+	// 实际Heap增长率, 等于总大小/存活大小-1
 	actualGrowthRatio := float64(c.heapLive)/float64(c.heapMarked) - 1
 	assistDuration := nanotime() - c.markStartTime
 
 	// Assume background mark hit its utilization goal.
+	// GC标记阶段的CPU占用率, 目标值是0.25
 	utilization := gcBackgroundUtilization
 	// Add assist utilization; avoid divide by zero.
 	if assistDuration > 0 {
+		// assistTime 是G辅助GC标记对象所使用的时间合计
+		// 额外的CPU占用率 = 辅助GC标记对象的总时间 / (GC标记使用时间 * P的数量)
 		utilization += float64(c.assistTime) / float64(assistDuration*int64(gomaxprocs))
 	}
 
+	// 触发系数偏移值 = 目标增长率 - 原触发系数 - CPU占用率 / 目标CPU占用率 * (实际增长率 - 原触发系数)
 	triggerError := goalGrowthRatio - c.triggerRatio - utilization/gcGoalUtilization*(actualGrowthRatio-c.triggerRatio)
 
 	// Finally, we adjust the trigger for next time by this error,
 	// damped by the proportional gain.
+	// 根据偏移值调整触发系数, 每次只调整偏移值的一半
 	triggerRatio := c.triggerRatio + triggerGain*triggerError
 
 	if debug.gcpacertrace > 0 {
@@ -591,6 +604,7 @@ func (c *gcControllerState) findRunnableGCWorker(_p_ *p) *g {
 		return nil
 	}
 
+	// 原子减少对应的值, 如果减少后大于等于0则返回true, 否则返回false
 	decIfPositive := func(ptr *int64) bool {
 		for {
 			v := atomic.Loadint64(ptr)
@@ -604,6 +618,7 @@ func (c *gcControllerState) findRunnableGCWorker(_p_ *p) *g {
 		}
 	}
 
+	// 减少dedicatedMarkWorkersNeeded, 成功时后台标记任务的模式是Dedicated
 	if decIfPositive(&c.dedicatedMarkWorkersNeeded) {
 		// This P is now dedicated to marking until the end of
 		// the concurrent mark phase.
@@ -617,6 +632,7 @@ func (c *gcControllerState) findRunnableGCWorker(_p_ *p) *g {
 		// goal?
 		//
 		// This should be kept in sync with pollFractionalWorkerExit.
+		// 执行标记任务的时间
 		delta := nanotime() - c.markStartTime
 		if delta > 0 && float64(_p_.gcFractionalMarkTime)/float64(delta) > c.fractionalUtilizationGoal {
 			// Nope. No need to run a fractional worker.
@@ -654,6 +670,7 @@ func (c *gcControllerState) commit(triggerRatio float64) {
 	// has grown by GOGC/100 over the heap marked by the last
 	// cycle.
 	goal := ^uint64(0)
+	// gcpercent 由环境变量 GOGC 决定
 	if c.gcPercent >= 0 {
 		goal = c.heapMarked + c.heapMarked*uint64(c.gcPercent)/100
 	}
@@ -701,6 +718,7 @@ func (c *gcControllerState) commit(triggerRatio float64) {
 	// grown by the trigger ratio over the marked heap size.
 	trigger := ^uint64(0)
 	if c.gcPercent >= 0 {
+		// 当前标记存活的大小乘以1+系数triggerRatio
 		trigger = uint64(float64(c.heapMarked) * (1 + triggerRatio))
 		// Don't trigger below the minimum heap size.
 		minTrigger := c.heapMinimum

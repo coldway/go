@@ -156,34 +156,43 @@ var oneptrmask = [...]uint8{1}
 func markroot(gcw *gcWork, i uint32) {
 	// Note: if you add a case here, please also update heapdump.go:dumproots.
 	switch {
+	// 扫描可读写的全局变量
+	// 这里只会扫描i对应的block, 扫描时传入包含哪里有指针的bitmap数据
 	case work.baseData <= i && i < work.baseBSS:
 		for _, datap := range activeModules() {
 			markrootBlock(datap.data, datap.edata-datap.data, datap.gcdatamask.bytedata, gcw, int(i-work.baseData))
 		}
 
+	// 扫描只读的全局变量
+	// 这里只会扫描i对应的block, 扫描时传入包含哪里有指针的bitmap数据
 	case work.baseBSS <= i && i < work.baseSpans:
 		for _, datap := range activeModules() {
 			markrootBlock(datap.bss, datap.ebss-datap.bss, datap.gcbssmask.bytedata, gcw, int(i-work.baseBSS))
 		}
 
+	// 扫描析构器队列
 	case i == fixedRootFinalizers:
 		for fb := allfin; fb != nil; fb = fb.alllink {
 			cnt := uintptr(atomic.Load(&fb.cnt))
 			scanblock(uintptr(unsafe.Pointer(&fb.fin[0])), cnt*unsafe.Sizeof(fb.fin[0]), &finptrmask[0], gcw, nil)
 		}
 
+	//清理sched->gfree->stack 链表中所有的栈 也就是释放已中止的 G 的栈
 	case i == fixedRootFreeGStacks:
 		// Switch to the system stack so we can call
 		// stackfree.
 		systemstack(markrootFreeGStacks)
 
+	// 扫描各个span中特殊对象(析构器列表)
 	case work.baseSpans <= i && i < work.baseStacks:
 		// mark mspan.specials
 		markrootSpans(gcw, int(i-work.baseSpans))
 
+	// 扫描各个G的栈
 	default:
 		// the rest is scanning goroutine stacks
 		var gp *g
+		//获取需要扫描grountine
 		if work.baseStacks <= i && i < work.baseEnd {
 			// N.B. Atomic read of allglen in gcMarkRootPrepare
 			// acts as a barrier to ensure that allgs must be large
@@ -203,6 +212,7 @@ func markroot(gcw *gcWork, i uint32) {
 		// scanstack must be done on the system stack in case
 		// we're trying to scan our own stack.
 		systemstack(func() {
+			// 判断扫描的栈是否自己的
 			// If this is a self-scan, put the user G in
 			// _Gwaiting to prevent self-deadlock. It may
 			// already be in _Gwaiting if this is a mark
@@ -229,10 +239,12 @@ func markroot(gcw *gcWork, i uint32) {
 			if gp.gcscandone {
 				throw("g already scanned")
 			}
+			//扫描它的栈
 			scanstack(gp, gcw)
 			gp.gcscandone = true
 			resumeG(stopped)
 
+			// 如果正在扫描自己的栈则把状态切换回运行中
 			if selfScan {
 				casgstatus(userG, _Gwaiting, _Grunning)
 			}
@@ -399,6 +411,7 @@ retry:
 	// balance positive. When the required amount of work is low,
 	// we over-assist to build up credit for future allocations
 	// and amortize the cost of assisting.
+	// 计算需要完成的标记任务数量
 	assistWorkPerByte := float64frombits(atomic.Load64(&gcController.assistWorkPerByte))
 	assistBytesPerWork := float64frombits(atomic.Load64(&gcController.assistBytesPerWork))
 	debtBytes := -gp.gcAssistBytes
@@ -414,6 +427,7 @@ retry:
 	// will just cause steals to fail until credit is accumulated
 	// again, so in the long run it doesn't really matter, but we
 	// do have to handle the negative credit case.
+	// 获取全局辅助标记的字节数
 	bgScanCredit := atomic.Loadint64(&gcController.bgScanCredit)
 	stolen := int64(0)
 	if bgScanCredit > 0 {
@@ -437,7 +451,8 @@ retry:
 			return
 		}
 	}
-
+	// 到这里说明 bgScanCredit 小于 scanWork
+	// 需要调用 gcDrainN 完成指定数量的标记任务并返回
 	if trace.enabled && !traced {
 		traced = true
 		traceGCMarkAssistStart()
@@ -445,6 +460,7 @@ retry:
 
 	// Perform assist work
 	systemstack(func() {
+		// 执行标记任务
 		gcAssistAlloc1(gp, scanWork)
 		// The user stack may have moved, so this can't touch
 		// anything on it until it returns from systemstack.
@@ -478,6 +494,8 @@ retry:
 		// there wasn't enough work to do anyway, so we might
 		// as well let background marking take care of the
 		// work that is available.
+		// 如果全局信用仍然不足将当前 Goroutine 陷入休眠
+		// 加入全局的辅助标记队列并等待后台标记任务的唤醒
 		if !gcParkAssist() {
 			goto retry
 		}
@@ -630,11 +648,13 @@ func gcParkAssist() bool {
 //
 //go:nowritebarrierrec
 func gcFlushBgCredit(scanWork int64) {
+	// 辅助队列中不存在等待的 Goroutine
 	if work.assistQueue.q.empty() {
 		// Fast path; there are no blocked assists. There's a
 		// small window here where an assist may add itself to
 		// the blocked queue and park. If that happens, we'll
 		// just get it on the next flush.
+		// 当前的信用会直接加到全局信用 bgScanCredit
 		atomic.Xaddint64(&gcController.bgScanCredit, scanWork)
 		return
 	}
@@ -643,10 +663,12 @@ func gcFlushBgCredit(scanWork int64) {
 	scanBytes := int64(float64(scanWork) * assistBytesPerWork)
 
 	lock(&work.assistQueue.lock)
+	// 如果辅助队列不为空
 	for !work.assistQueue.q.empty() && scanBytes > 0 {
 		gp := work.assistQueue.q.pop()
 		// Note that gp.gcAssistBytes is negative because gp
 		// is in debt. Think carefully about the signs below.
+		// 唤醒 Goroutine
 		if scanBytes+gp.gcAssistBytes >= 0 {
 			// Satisfy this entire assist debt.
 			scanBytes += gp.gcAssistBytes
@@ -671,6 +693,7 @@ func gcFlushBgCredit(scanWork int64) {
 		}
 	}
 
+	// 标记任务量仍然有剩余，这些标记任务都会加入全局信用
 	if scanBytes > 0 {
 		// Convert from scan bytes back to work.
 		assistWorkPerByte := float64frombits(atomic.Load64(&gcController.assistWorkPerByte))
@@ -685,6 +708,7 @@ func gcFlushBgCredit(scanWork int64) {
 // scanstack will also shrink the stack if it is safe to do so. If it
 // is not, it schedules a stack shrink for the next synchronous safe
 // point.
+// 使用超过1/4就不会被收缩。
 //
 // scanstack is marked go:systemstack because it must not be preempted
 // while using a workbuf.
@@ -714,11 +738,14 @@ func scanstack(gp *g, gcw *gcWork) {
 		throw("can't scan our own stack")
 	}
 
+	// 判断是否可以安全的进行 收缩栈
 	if isShrinkStackSafe(gp) {
 		// Shrink the stack if not much of it is being used.
+		// 收缩栈
 		shrinkstack(gp)
 	} else {
 		// Otherwise, shrink the stack at the next sync safe point.
+		// 否则下次安全点再进行收缩栈
 		gp.preemptShrink = true
 	}
 
@@ -741,19 +768,25 @@ func scanstack(gp *g, gcw *gcWork) {
 	}
 
 	// Scan the stack. Accumulate a list of stack objects.
+	// scanframeworker会根据代码地址(pc)获取函数信息
+	// 然后找到函数信息中的stackmap.bytedata, 它保存了函数的栈上哪些地方有指针
+	// 再调用scanblock来扫描函数的栈空间, 同时函数的参数也会这样扫描
 	scanframe := func(frame *stkframe, unused unsafe.Pointer) bool {
 		scanframeworker(frame, &state, gcw)
 		return true
 	}
+	// 枚举所有调用帧, 分别调用scanframe函数
 	gentraceback(^uintptr(0), ^uintptr(0), 0, gp, 0, nil, 0x7fffffff, scanframe, nil, 0)
 
 	// Find additional pointers that point into the stack from the heap.
 	// Currently this includes defers and panics. See also function copystack.
 
 	// Find and trace all defer arguments.
+	// 枚举所有defer的调用帧, 分别调用scanframe函数
 	tracebackdefers(gp, scanframe, nil)
 
 	// Find and trace other pointers in defer records.
+	// 扫描defer中的其他指针
 	for d := gp._defer; d != nil; d = d.link {
 		if d.fn != nil {
 			// tracebackdefers above does not scan the func value, which could
@@ -782,6 +815,7 @@ func scanstack(gp *g, gcw *gcWork) {
 	// The state's pointer queue prioritizes precise pointers over
 	// conservative pointers so that we'll prefer scanning stack
 	// objects precisely.
+	// 扫描并找到所有可达的栈对象
 	state.buildIndex()
 	for {
 		p, conservative := state.getPtr()
@@ -793,10 +827,12 @@ func scanstack(gp *g, gcw *gcWork) {
 			continue
 		}
 		r := obj.r
+		// 已被扫描过
 		if r == nil {
 			// We've already scanned this object.
 			continue
 		}
+		// 标记扫描
 		obj.setRecord(nil) // Don't scan it again.
 		if stackTraceDebug {
 			printlock()
@@ -983,10 +1019,14 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 	}
 
 	gp := getg().m.curg
+	// 看到抢占标志时是否要返回
 	preemptible := flags&gcDrainUntilPreempt != 0
+	// 是否计算后台的扫描量来减少辅助GC和唤醒等待中的G
 	flushBgCredit := flags&gcDrainFlushBgCredit != 0
+	// 是否只执行一定量的工作
 	idle := flags&gcDrainIdle != 0
 
+	// 记录初始的已扫描数量
 	initScanWork := gcw.scanWork
 
 	// checkWork is the scan work before performing the next
@@ -996,6 +1036,7 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 	if flags&(gcDrainIdle|gcDrainFractional) != 0 {
 		checkWork = initScanWork + drainCheckThreshold
 		if idle {
+			//idle模式下会去epoll里取g
 			check = pollWork
 		} else if flags&gcDrainFractional != 0 {
 			check = pollFractionalWorkerExit
@@ -1003,15 +1044,19 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 	}
 
 	// Drain root marking jobs.
+	// 如果根对象未扫描完, 则先扫描根对象
 	if work.markrootNext < work.markrootJobs {
 		// Stop if we're preemptible or if someone wants to STW.
 		for !(gp.preempt && (preemptible || atomic.Load(&sched.gcwaiting) != 0)) {
+			// 从根对象扫描队列取出一个值(原子递增)
 			job := atomic.Xadd(&work.markrootNext, +1) - 1
 			if job >= work.markrootJobs {
 				break
 			}
+			// 执行根对象扫描工作
 			markroot(gcw, job)
 			if check != nil && check() {
+				//如果是idle模式且拿到了可执行的g，就会去执行任务，这里就会返回
 				goto done
 			}
 		}
@@ -1025,12 +1070,18 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 		// just keep work available than to make workers wait. In the
 		// worst case, we'll do O(log(_WorkbufSize)) unnecessary
 		// balances.
+		// 如果全局标记队列为空, 把本地标记队列的一部分工作分过去
+		// (如果wbuf2不为空则移动wbuf2过去, 否则移动wbuf1的一半过去)
 		if work.full == 0 {
 			gcw.balance()
 		}
 
+		// 从本地标记队列中获取对象, 获取不到则从全局标记队列获取
+
+		// 非阻塞获取
 		b := gcw.tryGetFast()
 		if b == 0 {
+			// 阻塞获取
 			b = gcw.tryGet()
 			if b == 0 {
 				// Flush the write barrier
@@ -1040,17 +1091,22 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 				b = gcw.tryGet()
 			}
 		}
+		// 获取不到对象, 标记队列已为空, 跳出循环
 		if b == 0 {
 			// Unable to get work.
 			break
 		}
+		// 扫描获取到的对象
 		scanobject(b, gcw)
 
 		// Flush background scan work credit to the global
 		// account if we've accumulated enough locally so
 		// mutator assists can draw on it.
+		// 如果已经扫描了一定数量的对象(gcCreditSlack的值是2000)
 		if gcw.scanWork >= gcCreditSlack {
+			// 把扫描的对象数量添加到全局
 			atomic.Xaddint64(&gcController.scanWork, gcw.scanWork)
+			// 减少辅助GC的工作量和唤醒等待中的G
 			if flushBgCredit {
 				gcFlushBgCredit(gcw.scanWork - initScanWork)
 				initScanWork = 0
@@ -1058,6 +1114,7 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 			checkWork -= gcw.scanWork
 			gcw.scanWork = 0
 
+			// 如果是idle模式且达到了检查的扫描量, 则检查是否有其他任务(G), 如果有则跳出循环
 			if checkWork <= 0 {
 				checkWork += drainCheckThreshold
 				if check != nil && check() {
@@ -1068,9 +1125,11 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 	}
 
 done:
+	// 把扫描的对象数量添加到全局
 	// Flush remaining scan work credit.
 	if gcw.scanWork > 0 {
 		atomic.Xaddint64(&gcController.scanWork, gcw.scanWork)
+		// 减少辅助GC的工作量和唤醒等待中的G
 		if flushBgCredit {
 			gcFlushBgCredit(gcw.scanWork - initScanWork)
 		}
@@ -1170,25 +1229,33 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState)
 	b := b0
 	n := n0
 
+	// 枚举扫描的地址
 	for i := uintptr(0); i < n; {
+		// 找到bitmap中对应的byte
 		// Find bits for the next word.
 		bits := uint32(*addb(ptrmask, i/(sys.PtrSize*8)))
 		if bits == 0 {
 			i += sys.PtrSize * 8
 			continue
 		}
+		// 枚举byte
 		for j := 0; j < 8 && i < n; j++ {
+			// 如果该地址包含指针
 			if bits&1 != 0 {
+				// 标记在该地址的对象存活, 并把它加到标记队列(该对象变为灰色)
 				// Same work as in scanobject; see comments there.
 				p := *(*uintptr)(unsafe.Pointer(b + i))
 				if p != 0 {
+					// 找到该对象对应的span和bitmap
 					if obj, span, objIndex := findObject(p, b, i); obj != 0 {
+						// 标记一个对象存活, 并把它加到标记队列(该对象变为灰色)
 						greyobject(obj, b, i, span, gcw, objIndex)
 					} else if stk != nil && p >= stk.stack.lo && p < stk.stack.hi {
 						stk.putPtr(p, false)
 					}
 				}
 			}
+			// 处理下一个指针下一个bit
 			bits >>= 1
 			i += sys.PtrSize
 		}
@@ -1207,13 +1274,17 @@ func scanobject(b uintptr, gcw *gcWork) {
 	// b is either the beginning of an object, in which case this
 	// is the size of the object to scan, or it points to an
 	// oblet, in which case we compute the size to scan below.
+	// 获取 b 的 heapBits 对象
 	hbits := heapBitsForAddr(b)
+	// 获取 span
 	s := spanOfUnchecked(b)
+	// span 对应的对象大小
 	n := s.elemsize
 	if n == 0 {
 		throw("scanobject n == 0")
 	}
 
+	// 每次最大只扫描128KB
 	if n > maxObletBytes {
 		// Large object. Break into oblets for better
 		// parallelism and lower latency.
@@ -1234,6 +1305,7 @@ func scanobject(b uintptr, gcw *gcWork) {
 			// these will be marked as "no more pointers",
 			// so we'll drop out immediately when we go to
 			// scan those.
+			// 把多于128KB的对象重新放回gcworker中，下次再扫描
 			for oblet := b + maxObletBytes; oblet < s.base()+s.elemsize; oblet += maxObletBytes {
 				if !gcw.putFast(oblet) {
 					gcw.put(oblet)
@@ -1263,6 +1335,7 @@ func scanobject(b uintptr, gcw *gcWork) {
 
 		// Work here is duplicated in scanblock and above.
 		// If you make changes here, make changes there too.
+		// 取出指针的值
 		obj := *(*uintptr)(unsafe.Pointer(b + i))
 
 		// At this point we have extracted the next potential pointer.
@@ -1277,7 +1350,9 @@ func scanobject(b uintptr, gcw *gcWork) {
 			// heap. In this case, we know the object was
 			// just allocated and hence will be marked by
 			// allocation itself.
+			// 根据地址值去堆中查找对象
 			if obj, span, objIndex := findObject(obj, b, i); obj != 0 {
+				// 调用 greyobject 标记对象并把对象放到标记队列中
 				greyobject(obj, b, i, span, gcw, objIndex)
 			}
 		}
@@ -1407,6 +1482,7 @@ func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintp
 	mbits := span.markBitsForIndex(objIndex)
 
 	if useCheckmark {
+		// 检查是否所有可到达的对象都被正确标记的机制, 仅除错使用
 		if setCheckmark(obj, base, off, mbits) {
 			// Already marked.
 			return
@@ -1420,12 +1496,15 @@ func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintp
 			throw("marking free object")
 		}
 
+		// 如果对象所在的span中的gcmarkBits对应的bit已经设置为1则可以跳过处理
 		// If marked we have nothing to do.
 		if mbits.isMarked() {
 			return
 		}
+		// 标记对象
 		mbits.setMarked()
 
+		// 标记 span
 		// Mark span.
 		arena, pageIdx, pageMask := pageIndexOf(span.base())
 		if arena.pageMarks[pageIdx]&pageMask == 0 {
@@ -1434,6 +1513,8 @@ func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintp
 
 		// If this is a noscan object, fast-track it to black
 		// instead of greying it.
+		// 如果对象不是指针，则只需要标记，不需要放进队列，相当于直接标黑
+		// span的类型是noscan, 则不需要把对象放入标记队列
 		if span.spanclass.noscan() {
 			gcw.bytesMarked += uint64(span.elemsize)
 			return
@@ -1446,6 +1527,7 @@ func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintp
 	// Previously we put the obj in an 8 element buffer that is drained at a rate
 	// to give the PREFETCH time to do its work.
 	// Use of PREFETCHNTA might be more appropriate than PREFETCH
+	// 判断对象是否被放进队列，没有则放入，标灰步骤完成
 	if !gcw.putFast(obj) {
 		gcw.put(obj)
 	}
@@ -1538,6 +1620,7 @@ func gcMarkTinyAllocs() {
 		}
 		_, span, objIndex := findObject(c.tiny, 0, 0)
 		gcw := &p.gcw
+		// 标记存活对象，并把它加到 gcwork 标记队列
 		greyobject(c.tiny, 0, 0, span, gcw, objIndex)
 	}
 }

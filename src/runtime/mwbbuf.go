@@ -214,6 +214,7 @@ func wbBufFlush(dst *uintptr, src uintptr) {
 //go:systemstack
 func wbBufFlush1(_p_ *p) {
 	// Get the buffered pointers.
+	// 获取缓存的指针
 	start := uintptr(unsafe.Pointer(&_p_.wbBuf.buf[0]))
 	n := (_p_.wbBuf.next - start) / unsafe.Sizeof(_p_.wbBuf.buf[0])
 	ptrs := _p_.wbBuf.buf[:n]
@@ -257,6 +258,7 @@ func wbBufFlush1(_p_ *p) {
 			// path to reduce the rate of flushes?
 			continue
 		}
+		// 查找到对象
 		obj, span, objIndex := findObject(ptr, 0, 0)
 		if obj == 0 {
 			continue
@@ -264,12 +266,15 @@ func wbBufFlush1(_p_ *p) {
 		// TODO: Consider making two passes where the first
 		// just prefetches the mark bits.
 		mbits := span.markBitsForIndex(objIndex)
+		// 判断是否已被标记
 		if mbits.isMarked() {
 			continue
 		}
+		// 进行标记
 		mbits.setMarked()
 
 		// Mark span.
+		// 标记 span.
 		arena, pageIdx, pageMask := pageIndexOf(span.base())
 		if arena.pageMarks[pageIdx]&pageMask == 0 {
 			atomic.Or8(&arena.pageMarks[pageIdx], pageMask)
@@ -284,7 +289,8 @@ func wbBufFlush1(_p_ *p) {
 	}
 
 	// Enqueue the greyed objects.
+	// 将对象加入到 gcWork队列中
 	gcw.putBatch(ptrs[:pos])
-
+	// 重置 write barrier 缓存
 	_p_.wbBuf.reset()
 }

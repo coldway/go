@@ -74,8 +74,8 @@ func (p gclinkptr) ptr() *gclink {
 }
 
 type stackfreelist struct {
-	list gclinkptr // linked list of free stacks
-	size uintptr   // total size of stacks in list
+	list gclinkptr // linked list of free stacks  //前插 list
+	size uintptr   // total size of stacks in list //单位 byte
 }
 
 // dummy mspan that contains no free objects.

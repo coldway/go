@@ -205,11 +205,14 @@ func (w *gcWork) tryGet() uintptr {
 		wbuf = w.wbuf1
 		// wbuf is empty at this point.
 	}
+	// wbuf1缓冲区无数据时
 	if wbuf.nobj == 0 {
+		// wbuf1 与 wbuf2 进行对象互换
 		w.wbuf1, w.wbuf2 = w.wbuf2, w.wbuf1
 		wbuf = w.wbuf1
 		if wbuf.nobj == 0 {
 			owbuf := wbuf
+			// 从 work 的 full 队列中获取
 			wbuf = trygetfull()
 			if wbuf == nil {
 				return 0

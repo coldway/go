@@ -13,8 +13,10 @@
 // kernel for an ordinary -buildmode=exe program. The stack holds the
 // number of arguments and the C-style argv.
 TEXT _rt0_amd64(SB),NOSPLIT,$-8
-	MOVQ	0(SP), DI	// argc
-	LEAQ	8(SP), SI	// argv
+    // argc 将参数个数存入DI
+	MOVQ	0(SP), DI
+	// argv 参数数组的地址存入SI
+	LEAQ	8(SP), SI
 	JMP	runtime·rt0_go(SB)
 
 // main is common startup code for most amd64 systems when using
@@ -89,12 +91,13 @@ TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
 
 	// create istack out of the given (operating system) stack.
 	// _cgo_init may update stackguard.
-	MOVQ	$runtime·g0(SB), DI
-	LEAQ	(-64*1024+104)(SP), BX
-	MOVQ	BX, g_stackguard0(DI)
-	MOVQ	BX, g_stackguard1(DI)
-	MOVQ	BX, (g_stack+stack_lo)(DI)
-	MOVQ	SP, (g_stack+stack_hi)(DI)
+	// 为全局变量g0设置一些栈相关的属性
+	MOVQ	$runtime·g0(SB), DI    //  将全局变量g0的存入DI
+	LEAQ	(-64*1024+104)(SP), BX // bx = SP-(64*1024+104)，g0的栈帧大小
+	MOVQ	BX, g_stackguard0(DI)  // g0.stackguard0 = bx
+	MOVQ	BX, g_stackguard1(DI)  // g0.stackguard1 = bx
+	MOVQ	BX, (g_stack+stack_lo)(DI) // g0.stack.lo = bx    栈的低地址
+	MOVQ	SP, (g_stack+stack_hi)(DI) // g0.stack.hi = sp    栈的高地址
 
 	// find out information about the processor we're on
 	MOVL	$0, AX
@@ -178,27 +181,30 @@ needtls:
 	JMP ok
 #endif
 
-	LEAQ	runtime·m0+m_tls(SB), DI
-	CALL	runtime·settls(SB)
+    // 线程本地存储(tls)相关设置
+	LEAQ	runtime·m0+m_tls(SB), DI  // di = &m0.tls
+	CALL	runtime·settls(SB)        // 设置tls，下面有详细分析
 
 	// store through it, to make sure it works
-	get_tls(BX)
-	MOVQ	$0x123, g(BX)
-	MOVQ	runtime·m0+m_tls(SB), AX
-	CMPQ	AX, $0x123
+	// 验证tls是否生效：通过tls设置一个数值，然后m0.tls[0]获取，与设置的值对比。
+	get_tls(BX)                             // 获取fs地址到bx
+	MOVQ	$0x123, g(BX)                   // 反编译后 mov qword ptr fs:[0xfffffff8], 0x123，表示设置fs-8地址中的内容为0x123，其实就是m0.tls[0]的地址。
+	MOVQ	runtime·m0+m_tls(SB), AX        // ax = m0.tls[0]
+	CMPQ	AX, $0x123                      // 比较
 	JEQ 2(PC)
 	CALL	runtime·abort(SB)
 ok:
 	// set the per-goroutine and per-mach "registers"
-	get_tls(BX)
-	LEAQ	runtime·g0(SB), CX
-	MOVQ	CX, g(BX)
-	LEAQ	runtime·m0(SB), AX
+    // m0.tls[0] = &g0;  g0与m0相互绑定
+	get_tls(BX)                     // 获取fs地址到bx
+	LEAQ	runtime·g0(SB), CX      // cx = &g0
+	MOVQ	CX, g(BX)               // m0.tls[0] = &g0
+	LEAQ	runtime·m0(SB), AX      // ax = &m0
 
 	// save m->g0 = g0
-	MOVQ	CX, m_g0(AX)
+	MOVQ	CX, m_g0(AX)            // m0.g0 = &g0
 	// save m0 to g0->m
-	MOVQ	AX, g_m(CX)
+	MOVQ	AX, g_m(CX)             // g0.m = &m0
 
 	CLD				// convention is D is always left cleared
 	CALL	runtime·check(SB)
@@ -207,19 +213,27 @@ ok:
 	MOVL	AX, 0(SP)
 	MOVQ	24(SP), AX		// copy argv
 	MOVQ	AX, 8(SP)
-	CALL	runtime·args(SB)
-	CALL	runtime·osinit(SB)
-	CALL	runtime·schedinit(SB)
+	CALL	runtime·args(SB)        // 命令行参数相关，暂不关心
+	CALL	runtime·osinit(SB)      // 设置全局变量ncpu(cpu个数)，全局变量physHugePageSize
+	CALL	runtime·schedinit(SB)   // 调度器初始化
 
 	// create a new goroutine to start program
+	// 调用runtime·newproc创建goroutine，指向函数为runtime·main
 	MOVQ	$runtime·mainPC(SB), AX		// entry
+	// newproc 的第二个参数入栈，也就是新的 goroutine 需要执行的函数
+    // AX = &funcval{runtime·main},
 	PUSHQ	AX
+	// newproc 的第一个参数入栈，该参数表示 runtime.main 函数需要的参数大小，
+    // 因为 runtime.main 没有参数，所以这里是 0
+    // 创建 main goroutine。非main goroutine也是此方法创建。
+    // go编译会将语句 go foo() 编译为 runtime·newproc(SB) 并传入参数。
 	PUSHQ	$0			// arg size
 	CALL	runtime·newproc(SB)
 	POPQ	AX
 	POPQ	AX
 
 	// start this M
+	// 主线程进入调度循环，运行刚刚创建的 goroutine
 	CALL	runtime·mstart(SB)
 
 	CALL	runtime·abort(SB)	// mstart should never return
@@ -255,25 +269,29 @@ TEXT runtime·mstart(SB),NOSPLIT|TOPFRAME,$0
 // func gogo(buf *gobuf)
 // restore state from Gobuf; longjmp
 TEXT runtime·gogo(SB), NOSPLIT, $0-8
+    // bx = &gp.sched
 	MOVQ	buf+0(FP), BX		// gobuf
+	// dx = gp.sched.g ，也就是存储的 newg 指针
 	MOVQ	gobuf_g(BX), DX
 	MOVQ	0(DX), CX		// make sure g != nil
 	JMP	gogo<>(SB)
 
 TEXT gogo<>(SB), NOSPLIT, $0
 	get_tls(CX)
+    // newg指针设置到tls
 	MOVQ	DX, g(CX)
 	MOVQ	DX, R14		// set the g register
 	MOVQ	gobuf_sp(BX), SP	// restore SP
+	// 下面四条是加载上下文到cpu寄存器。
 	MOVQ	gobuf_ret(BX), AX
 	MOVQ	gobuf_ctxt(BX), DX
 	MOVQ	gobuf_bp(BX), BP
-	MOVQ	$0, gobuf_sp(BX)	// clear to help garbage collector
+	MOVQ	$0, gobuf_sp(BX)	// clear to help garbage collector // 下面四条是清零，减少gc的工作量。
 	MOVQ	$0, gobuf_ret(BX)
 	MOVQ	$0, gobuf_ctxt(BX)
 	MOVQ	$0, gobuf_bp(BX)
-	MOVQ	gobuf_pc(BX), BX
-	JMP	BX
+	MOVQ	gobuf_pc(BX), BX    // gobuf.pc 存储的是要执行的函数指针，初始化时此函数为runtime.main
+	JMP	BX                      // 跳转到要执行的函数
 
 // func mcall(fn func(*g))
 // Switch to m->g0's stack, call fn(g).
@@ -321,9 +339,13 @@ TEXT runtime·mcall(SB), NOSPLIT, $0-8
 	MOVQ	BP, (g_sched+gobuf_bp)(AX)
 
 	// switch to m->g0 & its stack, call fn
+	//BX = g
 	MOVQ	g(CX), BX
+	//BX = g.m
 	MOVQ	g_m(BX), BX
+	//SI = g.m.g0
 	MOVQ	m_g0(BX), SI
+	//此刻，SI = g0， AX = g，所以这里在判断g 是否是 g0，如果g == g0则一定是哪里代码写错了
 	CMPQ	SI, AX	// if g == m->g0 call badmcall
 	JNE	3(PC)
 	MOVQ	$runtime·badmcall(SB), AX
@@ -334,6 +356,7 @@ TEXT runtime·mcall(SB), NOSPLIT, $0-8
 	PUSHQ	AX
 	MOVQ	DI, DX
 	MOVQ	0(DI), DI
+	//#调用goexit0(g)
 	CALL	DI
 	POPQ	AX
 	MOVQ	$runtime·badmcall2(SB), AX
@@ -1631,8 +1654,11 @@ TEXT runtime·gcWriteBarrier<ABIInternal>(SB),NOSPLIT,$112
 	// Increment wbBuf.next position.
 	LEAQ	16(R12), R12
 	MOVQ	R12, (p_wbBuf+wbBuf_next)(R13)
+	// 检查 buffer 队列是否满？
 	CMPQ	R12, (p_wbBuf+wbBuf_end)(R13)
+	// 赋值的前后两个值都会被入队
 	// Record the write.
+	// 把 value 存到指定 buffer 位置
 	MOVQ	AX, -16(R12)	// Record value
 	// Note: This turns bad pointer writes into bad
 	// pointer reads, which could be confusing. We could avoid
@@ -1640,11 +1666,14 @@ TEXT runtime·gcWriteBarrier<ABIInternal>(SB),NOSPLIT,$112
 	// take care of the vast majority of these. We could
 	// patch this up in the signal handler, or use XCHG to
 	// combine the read and the write.
+	// 把 *slot 存到指定 buffer 位置
 	MOVQ	(DI), R13
 	MOVQ	R13, -8(R12)	// Record *slot
 	// Is the buffer full? (flags set in CMPQ above)
+	// 如果 wbBuffer 队列满了，那么就下刷处理，比如置灰，置黑等操作
 	JEQ	flush
 ret:
+    // 赋值：*slot = val
 	MOVQ	96(SP), R12
 	MOVQ	104(SP), R13
 	// Do the write.
@@ -1682,6 +1711,7 @@ flush:
 	MOVQ	R15, 88(SP)
 
 	// This takes arguments DI and AX
+	//  队列满了，统一处理，这个其实是一个批量优化手段
 	CALL	runtime·wbBufFlush(SB)
 
 	MOVQ	0(SP), DI

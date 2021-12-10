@@ -71,7 +71,9 @@ func endCheckmarks() {
 // and otherwise sets obj's checkmark. It returns true if obj was
 // already checkmarked.
 func setCheckmark(obj, base, off uintptr, mbits markBits) bool {
+	// 这里是用来debug，确保所有的对象都被正确标识
 	if !mbits.isMarked() {
+		// 这个对象没有被标记
 		printlock()
 		print("runtime: checkmarks found unexpected unmarked object obj=", hex(obj), "\n")
 		print("runtime: found obj at *(", hex(base), "+", hex(off), ")\n")
